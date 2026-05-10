@@ -316,14 +316,9 @@ jobs:
           ./test_lto_same_linked
           echo "Clang LTO same-length link+run OK"
 
-      - name: Test objcopy (Clang LTO, variable-length via libLLVM)
+      - name: Test objcopy (Clang LTO, variable-length)
         run: |
           CC=clang-${{ matrix.clang }}
-          # Find libLLVM
-          LLVM_VER=${{ matrix.clang }}
-          if [ -f "/usr/lib/llvm-${LLVM_VER}/lib/libLLVM.so" ]; then
-            export LD_LIBRARY_PATH="/usr/lib/llvm-${LLVM_VER}/lib:${LD_LIBRARY_PATH:-}"
-          fi
           python -c "
           from objcopy import rename_obj
           n = rename_obj('test_funcs_lto.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_lto_var.o', clang='clang-${{ matrix.clang }}')
@@ -540,7 +535,7 @@ jobs:
           assert n == 2
           "
 
-      - name: Test objcopy (Clang LTO, variable-length via libLLVM)
+      - name: Test objcopy (Clang LTO, variable-length)
         run: |
           python -c "
           from objcopy import rename_obj
@@ -563,10 +558,6 @@ jobs:
 
       - name: Test objcopy (Mach-O LTO, variable-length + link)
         run: |
-          XCODE_LIB=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib
-          if [ -d "$XCODE_LIB" ]; then
-            export DYLD_LIBRARY_PATH="$XCODE_LIB:${DYLD_LIBRARY_PATH:-}"
-          fi
           python -c "
           from objcopy import rename_obj
           n = rename_obj('test_funcs_lto_macho.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_lto_var_macho.o', clang='clang')

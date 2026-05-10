@@ -561,6 +561,9 @@ def nm_clang_lto(path):
             strtab_len = len(strtab_data)
             if strtab_len < 1:
                 continue
+            b0 = strtab_data[0]
+            if not (b0 == 95 or 48 <= b0 <= 57 or 65 <= b0 <= 90 or 97 <= b0 <= 122):
+                continue
 
             for sym_skip in range(0, min(len(raw_symtab) - 24, 128), 4):
                 symtab_blob = raw_symtab[sym_skip:]

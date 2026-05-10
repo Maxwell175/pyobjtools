@@ -22,6 +22,7 @@ Use rename_obj() for auto-detection, or call format-specific functions directly.
 import struct
 import subprocess
 import os
+import re
 import tempfile
 
 def _zstd_decompress(compressed):
@@ -944,213 +945,82 @@ def _clang_lto_rename_same_length(data, strtab_start, strtab_end, rename_map):
         old_bytes = old_name.encode("ascii")
         new_bytes = new_name.encode("ascii")
         pos = strtab_start
+        hit = False
         while pos < strtab_end:
             idx = data.find(old_bytes, pos, strtab_end)
             if idx == -1:
                 break
             data[idx:idx + len(old_bytes)] = new_bytes
-            renamed += 1
+            hit = True
             pos = idx + len(new_bytes)
+        if hit:
+            renamed += 1
 
     return data, renamed
 
 
-def _libllvm_from_compiler(clang_binary):
-    """Extract the libLLVM path from the compiler binary's dynamic dependencies."""
-    import ctypes
-    import shutil
-    import sys
-
-    clang_path = shutil.which(clang_binary)
-    if not clang_path:
-        return None
-
-    try:
-        if sys.platform == "darwin":
-            r = subprocess.run(["otool", "-L", clang_path],
-                               capture_output=True, text=True, timeout=5)
-        else:
-            r = subprocess.run(["ldd", clang_path],
-                               capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-    if r.returncode != 0:
-        return None
-
-    for line in r.stdout.splitlines():
-        if "libLLVM" not in line:
-            continue
-        if sys.platform == "darwin":
-            lib_path = line.strip().split()[0]
-        else:
-            parts = line.split("=>")
-            if len(parts) < 2:
-                continue
-            lib_path = parts[1].strip().split()[0]
-        if lib_path and os.path.isfile(lib_path):
-            try:
-                return ctypes.CDLL(lib_path)
-            except OSError:
-                continue
-
-    return None
-
-
-def _find_libllvm(clang_binary="clang"):
-    """Find and load the libLLVM shared library."""
-    import ctypes
-    import ctypes.util
-    import glob as glob_mod
-    import sys
-
-    lib = _libllvm_from_compiler(clang_binary)
-    if lib is not None:
-        return lib
-
-    if sys.platform == "win32":
-        lib_name = ctypes.util.find_library("LLVM-C")
-        if lib_name:
-            try:
-                return ctypes.CDLL(lib_name)
-            except OSError:
-                pass
-        for d in os.environ.get("PATH", "").split(os.pathsep):
-            for match in glob_mod.glob(os.path.join(d, "LLVM-C.dll")):
-                try:
-                    return ctypes.CDLL(match)
-                except OSError:
-                    continue
-    elif sys.platform == "darwin":
-        try:
-            r = subprocess.run(["xcode-select", "-p"], capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                xcode_lib = os.path.join(r.stdout.strip(), "Toolchains/XcodeDefault.xctoolchain/usr/lib")
-                for match in glob_mod.glob(os.path.join(xcode_lib, "libLLVM*.dylib")):
-                    try:
-                        return ctypes.CDLL(match)
-                    except OSError:
-                        continue
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        for ver in range(25, 14, -1):
-            try:
-                return ctypes.CDLL(f"libLLVM-{ver}.dylib")
-            except OSError:
-                continue
-        try:
-            return ctypes.CDLL("libLLVM.dylib")
-        except OSError:
-            pass
-        lib_name = ctypes.util.find_library("LLVM")
-        if lib_name:
-            try:
-                return ctypes.CDLL(lib_name)
-            except OSError:
-                pass
-    else:
-        for ver in range(25, 14, -1):
-            try:
-                return ctypes.CDLL(f"libLLVM-{ver}.so")
-            except OSError:
-                continue
-        try:
-            return ctypes.CDLL("libLLVM.so")
-        except OSError:
-            pass
-        lib_name = ctypes.util.find_library("LLVM")
-        if lib_name:
-            try:
-                return ctypes.CDLL(lib_name)
-            except OSError:
-                pass
-
-    return None
-
-
-_libllvm_cache = {}
-
-
-def _get_libllvm(clang_binary="clang"):
-    """Get cached libLLVM handle for a given compiler binary."""
-    if clang_binary not in _libllvm_cache:
-        _libllvm_cache[clang_binary] = _find_libllvm(clang_binary)
-    return _libllvm_cache[clang_binary]
-
-
 def _clang_lto_rename_variable_length(data, rename_map, clang="clang"):
-    """Variable-length rename using libLLVM to parse and rewrite bitcode."""
-    import ctypes
+    """Variable-length rename of Clang LTO bitcode by round-tripping through
+    textual IR.
 
-    llvm = _get_libllvm(clang)
-    if llvm is None:
+    Uses `clang -x ir -S -emit-llvm` to disassemble, substitutes `@old_name`
+    references identifier-boundary-aware, and reassembles with
+    `clang -x ir -c -emit-llvm`. Keeps us decoupled from bitcode format
+    details so it works across LLVM versions and on toolchains that do not
+    ship libLLVM (notably Apple's).
+    """
+    import shutil
+    import tempfile
+
+    if not shutil.which(clang):
         raise RuntimeError(
-            "Clang LTO variable-length rename requires libLLVM shared library. "
-            "Install LLVM (e.g., 'apt install libllvm-21') or ensure libLLVM is on "
-            "the library search path."
-        )
+            f"Clang LTO variable-length rename requires '{clang}' on PATH.")
 
-    llvm.LLVMContextCreate.restype = ctypes.c_void_p
-    llvm.LLVMCreateMemoryBufferWithMemoryRange.restype = ctypes.c_void_p
-    llvm.LLVMCreateMemoryBufferWithMemoryRange.argtypes = [
-        ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int]
-    llvm.LLVMParseBitcodeInContext2.restype = ctypes.c_int
-    llvm.LLVMParseBitcodeInContext2.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-    llvm.LLVMWriteBitcodeToMemoryBuffer.restype = ctypes.c_void_p
-    llvm.LLVMWriteBitcodeToMemoryBuffer.argtypes = [ctypes.c_void_p]
-    llvm.LLVMGetBufferStart.restype = ctypes.POINTER(ctypes.c_char)
-    llvm.LLVMGetBufferStart.argtypes = [ctypes.c_void_p]
-    llvm.LLVMGetBufferSize.restype = ctypes.c_size_t
-    llvm.LLVMGetBufferSize.argtypes = [ctypes.c_void_p]
-    llvm.LLVMGetFirstFunction.restype = ctypes.c_void_p
-    llvm.LLVMGetFirstFunction.argtypes = [ctypes.c_void_p]
-    llvm.LLVMGetNextFunction.restype = ctypes.c_void_p
-    llvm.LLVMGetNextFunction.argtypes = [ctypes.c_void_p]
-    llvm.LLVMGetValueName2.restype = ctypes.c_char_p
-    llvm.LLVMGetValueName2.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
-    llvm.LLVMSetValueName2.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-    llvm.LLVMDisposeModule.argtypes = [ctypes.c_void_p]
-    llvm.LLVMDisposeMemoryBuffer.argtypes = [ctypes.c_void_p]
-    llvm.LLVMContextDispose.argtypes = [ctypes.c_void_p]
+    with tempfile.TemporaryDirectory() as td:
+        bc_in = os.path.join(td, "in.bc")
+        ll_mid = os.path.join(td, "mid.ll")
+        bc_out = os.path.join(td, "out.bc")
 
-    rename_map_bytes = {k.encode("ascii"): v.encode("ascii") for k, v in rename_map.items()}
+        with open(bc_in, "wb") as f:
+            f.write(bytes(data))
 
-    data_bytes = bytes(data)
-    ctx = llvm.LLVMContextCreate()
-    try:
-        buf = llvm.LLVMCreateMemoryBufferWithMemoryRange(
-            data_bytes, len(data_bytes), b"input", 0)
-        mod = ctypes.c_void_p()
-        rc = llvm.LLVMParseBitcodeInContext2(ctx, buf, ctypes.byref(mod))
-        if rc != 0:
-            raise RuntimeError("libLLVM failed to parse bitcode")
+        r = subprocess.run(
+            [clang, "-x", "ir", "-S", "-emit-llvm", bc_in, "-o", ll_mid],
+            capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"clang failed to disassemble bitcode: {r.stderr.decode(errors='replace')}")
 
-        try:
-            renamed = 0
-            fn = llvm.LLVMGetFirstFunction(mod)
-            while fn:
-                sz = ctypes.c_size_t()
-                name = llvm.LLVMGetValueName2(fn, ctypes.byref(sz))
-                if name in rename_map_bytes:
-                    new_name = rename_map_bytes[name]
-                    llvm.LLVMSetValueName2(fn, new_name, len(new_name))
-                    renamed += 1
-                fn = llvm.LLVMGetNextFunction(fn)
+        with open(ll_mid, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
 
-            out_buf = llvm.LLVMWriteBitcodeToMemoryBuffer(mod)
-            try:
-                out_start = llvm.LLVMGetBufferStart(out_buf)
-                out_size = llvm.LLVMGetBufferSize(out_buf)
-                new_data = bytearray(ctypes.string_at(out_start, out_size))
-            finally:
-                llvm.LLVMDisposeMemoryBuffer(out_buf)
-        finally:
-            llvm.LLVMDisposeModule(mod)
-    finally:
-        llvm.LLVMContextDispose(ctx)
+        renamed = 0
+        ident_tail = r"(?![A-Za-z0-9_$.])"
+        ident_head = r"(?<![A-Za-z0-9_$.])"
+        for old, new in rename_map.items():
+            pattern = ident_head + r"@" + re.escape(old) + ident_tail
+            text, count = re.subn(pattern, "@" + new, text)
+            if count:
+                renamed += 1
 
-    return new_data, renamed
+        with open(ll_mid, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        r = subprocess.run(
+            [clang, "-x", "ir", "-c", "-emit-llvm", ll_mid, "-o", bc_out],
+            capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"clang failed to reassemble bitcode: {r.stderr.decode(errors='replace')}")
+
+        with open(bc_out, "rb") as f:
+            new_data = bytearray(f.read())
+
+    # Caller works with unwrapped bitcode. Clang may emit a Mach-O-wrapped
+    # .bc on Darwin; unwrap so the returned inner bitcode matches the
+    # contract and is not double-wrapped on write.
+    inner, _wrapper = _unwrap_bitcode(new_data)
+    return inner, renamed
 
 
 def _unwrap_bitcode(data):
@@ -1175,7 +1045,8 @@ def rename_clang_lto(obj_path, rename_map, output_path=None, clang="clang"):
     """Rename symbols in a Clang LTO bitcode object file.
 
     Same-length renames use fast in-place STRTAB overwrite.
-    Variable-length renames use libLLVM to fully rewrite the bitcode.
+    Variable-length renames round-trip through textual IR using the clang
+    binary, keeping us decoupled from bitcode format details.
     """
     if output_path is None:
         output_path = obj_path
