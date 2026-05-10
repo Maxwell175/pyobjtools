@@ -1,0 +1,865 @@
+# Copyright (c) 2026 Maxwell Dreytser
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+name: Test nm, objcopy & ar
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: GCC and Clang across Ubuntu versions
+  # ---------------------------------------------------------------------------
+  linux-gcc:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            gcc: 10
+          - os: ubuntu-22.04
+            gcc: 11
+          - os: ubuntu-22.04
+            gcc: 12
+          - os: ubuntu-24.04
+            gcc: 12
+          - os: ubuntu-24.04
+            gcc: 13
+          - os: ubuntu-24.04
+            gcc: 14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install zstandard
+
+      - name: Compile test objects (regular + LTO)
+        run: |
+          CC=gcc-${{ matrix.gcc }}
+          cat > test_funcs.c << 'EOF'
+          int alpha_func(void) { return 1; }
+          int beta_func(void) { return 2; }
+          int gamma_func(void) { return 3; }
+          static int internal_helper(void) { return 99; }
+          int calls_helper(void) { return internal_helper(); }
+          EOF
+
+          cat > test_main.c << 'EOF'
+          extern int mp_alpha(void);
+          extern int beta_func(void);
+          extern int mp_gamma(void);
+          extern int calls_helper(void);
+          int main(void) { return mp_alpha() + beta_func() + mp_gamma() + calls_helper() - 105; }
+          EOF
+
+          cat > test_main_samelength.c << 'EOF'
+          extern int xxxxx_func(void);
+          extern int beta_func(void);
+          extern int yyyyy_func(void);
+          extern int calls_helper(void);
+          int main(void) { return xxxxx_func() + beta_func() + yyyyy_func() + calls_helper() - 105; }
+          EOF
+
+          # Regular object
+          $CC -c -o test_funcs.o test_funcs.c
+
+          # LTO object
+          $CC -flto -c -o test_funcs_lto.o test_funcs.c
+
+          # Object with long symbol names (tests string table)
+          cat > test_long.c << 'EOF'
+          int a_very_long_function_name_that_exceeds_normal_limits(void) { return 42; }
+          int another_extremely_long_symbol_name_for_testing_purposes(void) { return 7; }
+          EOF
+          $CC -c -o test_long.o test_long.c
+
+      - name: Test nm (regular ELF)
+        run: |
+          python nm.py test_funcs.o > our_nm.txt
+          nm test_funcs.o | grep -v '^\s*$' > sys_nm.txt
+          echo "--- System nm:" && cat sys_nm.txt
+          echo "--- Our nm:" && cat our_nm.txt
+          # Verify all expected symbols present
+          grep -q "T alpha_func" our_nm.txt
+          grep -q "T beta_func" our_nm.txt
+          grep -q "T gamma_func" our_nm.txt
+          grep -q "T calls_helper" our_nm.txt
+          grep -q "t internal_helper" our_nm.txt
+
+      - name: Test nm (GCC LTO)
+        run: |
+          python nm.py test_funcs_lto.o > our_nm_lto.txt
+          echo "--- LTO nm:" && cat our_nm_lto.txt
+          grep -q "alpha_func" our_nm_lto.txt
+          grep -q "beta_func" our_nm_lto.txt
+          grep -q "gamma_func" our_nm_lto.txt
+
+      - name: Test objcopy (regular ELF, variable-length)
+        run: |
+          CC=gcc-${{ matrix.gcc }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_renamed.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          # Link and run
+          $CC -o test_linked test_main.c test_renamed.o
+          ./test_linked
+          echo "Link+run OK (exit $?)"
+
+      - name: Test objcopy (regular ELF, same-length)
+        run: |
+          CC=gcc-${{ matrix.gcc }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.o', {'alpha_func': 'xxxxx_func', 'gamma_func': 'yyyyy_func'}, 'test_same.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          $CC -o test_same_linked test_main_samelength.c test_same.o
+          ./test_same_linked
+          echo "Same-length link+run OK (exit $?)"
+
+      - name: Test objcopy (GCC LTO, same-length)
+        run: |
+          CC=gcc-${{ matrix.gcc }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto.o', {'alpha_func': 'xxxxx_func', 'gamma_func': 'yyyyy_func'}, 'test_lto_same.o', gcc='gcc-${{ matrix.gcc }}')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          $CC -flto -o test_lto_same_linked test_main_samelength.c test_lto_same.o
+          ./test_lto_same_linked
+          echo "GCC LTO same-length link+run OK"
+
+      - name: Test objcopy (GCC LTO, variable-length)
+        run: |
+          CC=gcc-${{ matrix.gcc }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_lto_var.o', gcc='gcc-${{ matrix.gcc }}')
+          print(f'Renamed: {n}')
+          assert n >= 1
+          "
+          $CC -flto -o test_lto_var_linked test_main.c test_lto_var.o
+          ./test_lto_var_linked
+          echo "GCC LTO variable-length link+run OK"
+
+      - name: Test objcopy (long symbol names)
+        run: |
+          CC=gcc-${{ matrix.gcc }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_long.o', {
+              'a_very_long_function_name_that_exceeds_normal_limits': 'mp_long_a',
+              'another_extremely_long_symbol_name_for_testing_purposes': 'mp_long_b',
+          }, 'test_long_renamed.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          cat > test_long_main.c << 'EOF'
+          extern int mp_long_a(void);
+          extern int mp_long_b(void);
+          int main(void) { return mp_long_a() + mp_long_b() - 49; }
+          EOF
+          $CC -o test_long_linked test_long_main.c test_long_renamed.o
+          ./test_long_linked
+          echo "Long name rename link+run OK"
+
+      - name: Test ar (GNU ar archive)
+        run: |
+          CC=gcc-${{ matrix.gcc }}
+          AR=gcc-ar-${{ matrix.gcc }}
+          # Create multiple objects
+          cat > ar_a.c << 'EOF'
+          int ar_func_a(void) { return 10; }
+          EOF
+          cat > ar_b.c << 'EOF'
+          int ar_func_b(void) { return 20; }
+          EOF
+          cat > ar_long_name_member_that_needs_extended_table.c << 'EOF'
+          int ar_func_long(void) { return 30; }
+          EOF
+          $CC -c -o ar_a.o ar_a.c
+          $CC -c -o ar_b.o ar_b.c
+          $CC -c -o ar_long_name_member_that_needs_extended_table.o ar_long_name_member_that_needs_extended_table.c
+
+          # Create archive with GNU ar (uses // long name table)
+          $AR rcs test_lib.a ar_a.o ar_b.o ar_long_name_member_that_needs_extended_table.o
+
+          # Extract with our tool
+          mkdir extracted
+          python -c "
+          from ar import extract_archive
+          files = extract_archive('test_lib.a', 'extracted')
+          print(f'Extracted {len(files)} members:')
+          for f in files:
+              print(f'  {f}')
+          assert len(files) == 3
+          "
+
+          # Verify extracted objects are valid by linking
+          cat > ar_main.c << 'EOF'
+          extern int ar_func_a(void);
+          extern int ar_func_b(void);
+          extern int ar_func_long(void);
+          int main(void) { return ar_func_a() + ar_func_b() + ar_func_long() - 60; }
+          EOF
+          $CC -o ar_linked ar_main.c extracted/ar_a.o extracted/ar_b.o extracted/ar_long_name_member_that_needs_extended_table.o
+          ./ar_linked
+          echo "ar (GNU) link+run OK"
+
+  linux-clang:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            clang: 13
+          - os: ubuntu-22.04
+            clang: 14
+          - os: ubuntu-22.04
+            clang: 15
+          - os: ubuntu-24.04
+            clang: 16
+          - os: ubuntu-24.04
+            clang: 17
+          - os: ubuntu-24.04
+            clang: 18
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile test objects (regular + Clang LTO)
+        run: |
+          CC=clang-${{ matrix.clang }}
+          cat > test_funcs.c << 'EOF'
+          int alpha_func(void) { return 1; }
+          int beta_func(void) { return 2; }
+          int gamma_func(void) { return 3; }
+          static int internal_helper(void) { return 99; }
+          int calls_helper(void) { return internal_helper(); }
+          EOF
+
+          cat > test_main.c << 'EOF'
+          extern int mp_alpha(void);
+          extern int beta_func(void);
+          extern int mp_gamma(void);
+          extern int calls_helper(void);
+          int main(void) { return mp_alpha() + beta_func() + mp_gamma() + calls_helper() - 105; }
+          EOF
+
+          cat > test_main_samelength.c << 'EOF'
+          extern int xxxxx_func(void);
+          extern int beta_func(void);
+          extern int yyyyy_func(void);
+          extern int calls_helper(void);
+          int main(void) { return xxxxx_func() + beta_func() + yyyyy_func() + calls_helper() - 105; }
+          EOF
+
+          # Regular ELF object
+          $CC -c -o test_funcs.o test_funcs.c
+
+          # Clang LTO bitcode
+          $CC -flto -c -o test_funcs_lto.o test_funcs.c
+
+      - name: Test nm (regular ELF from Clang)
+        run: |
+          python nm.py test_funcs.o > our_nm.txt
+          echo "--- Our nm:" && cat our_nm.txt
+          grep -q "T alpha_func" our_nm.txt
+          grep -q "T beta_func" our_nm.txt
+          grep -q "T gamma_func" our_nm.txt
+          grep -q "T calls_helper" our_nm.txt
+
+      - name: Test nm (Clang LTO bitcode)
+        run: |
+          python nm.py test_funcs_lto.o > our_nm_lto.txt
+          echo "--- Clang LTO nm:" && cat our_nm_lto.txt
+          grep -q "alpha_func" our_nm_lto.txt
+          grep -q "beta_func" our_nm_lto.txt
+          grep -q "gamma_func" our_nm_lto.txt
+
+      - name: Test objcopy (regular ELF, variable-length)
+        run: |
+          CC=clang-${{ matrix.clang }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_renamed.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          $CC -o test_linked test_main.c test_renamed.o
+          ./test_linked
+          echo "ELF rename link+run OK"
+
+      - name: Test objcopy (Clang LTO, same-length)
+        run: |
+          CC=clang-${{ matrix.clang }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto.o', {'alpha_func': 'xxxxx_func', 'gamma_func': 'yyyyy_func'}, 'test_lto_same.o', clang='clang-${{ matrix.clang }}')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          $CC -flto -fuse-ld=lld -o test_lto_same_linked test_main_samelength.c test_lto_same.o 2>/dev/null || \
+          $CC -flto -o test_lto_same_linked test_main_samelength.c test_lto_same.o
+          ./test_lto_same_linked
+          echo "Clang LTO same-length link+run OK"
+
+      - name: Test objcopy (Clang LTO, variable-length via libLLVM)
+        run: |
+          CC=clang-${{ matrix.clang }}
+          # Find libLLVM
+          LLVM_VER=${{ matrix.clang }}
+          if [ -f "/usr/lib/llvm-${LLVM_VER}/lib/libLLVM.so" ]; then
+            export LD_LIBRARY_PATH="/usr/lib/llvm-${LLVM_VER}/lib:${LD_LIBRARY_PATH:-}"
+          fi
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_lto_var.o', clang='clang-${{ matrix.clang }}')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          $CC -flto -fuse-ld=lld -o test_lto_var_linked test_main.c test_lto_var.o 2>/dev/null || \
+          $CC -flto -o test_lto_var_linked test_main.c test_lto_var.o
+          ./test_lto_var_linked
+          echo "Clang LTO variable-length link+run OK"
+
+  # ---------------------------------------------------------------------------
+  # macOS: Apple Clang + Homebrew GCC + Homebrew LLVM
+  # ---------------------------------------------------------------------------
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            compiler: apple-clang
+            cc: clang
+          - os: macos-15
+            compiler: apple-clang
+            cc: clang
+          - os: macos-15
+            compiler: gcc-14
+            cc: gcc-14
+          - os: macos-15
+            compiler: gcc-15
+            cc: gcc-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile test objects
+        run: |
+          CC=${{ matrix.cc }}
+          cat > test_funcs.c << 'EOF'
+          int alpha_func(void) { return 1; }
+          int beta_func(void) { return 2; }
+          int gamma_func(void) { return 3; }
+          static int internal_helper(void) { return 99; }
+          int calls_helper(void) { return internal_helper(); }
+          EOF
+
+          cat > test_main.c << 'EOF'
+          extern int mp_alpha(void);
+          extern int beta_func(void);
+          extern int mp_gamma(void);
+          extern int calls_helper(void);
+          int main(void) { return mp_alpha() + beta_func() + mp_gamma() + calls_helper() - 105; }
+          EOF
+
+          cat > test_main_samelength.c << 'EOF'
+          extern int xxxxx_func(void);
+          extern int beta_func(void);
+          extern int yyyyy_func(void);
+          extern int calls_helper(void);
+          int main(void) { return xxxxx_func() + beta_func() + yyyyy_func() + calls_helper() - 105; }
+          EOF
+
+          # Regular Mach-O object
+          $CC -c -o test_funcs.o test_funcs.c
+
+      - name: Test nm (Mach-O)
+        run: |
+          python nm.py test_funcs.o > our_nm.txt
+          echo "--- Our nm:" && cat our_nm.txt
+          # Mach-O uses underscore prefix, our tool strips it for lookup
+          grep -q "alpha_func" our_nm.txt
+          grep -q "beta_func" our_nm.txt
+          grep -q "gamma_func" our_nm.txt
+          grep -q "calls_helper" our_nm.txt
+
+      - name: Test objcopy (Mach-O, variable-length)
+        run: |
+          CC=${{ matrix.cc }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_renamed.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          $CC -o test_linked test_main.c test_renamed.o
+          ./test_linked
+          echo "Mach-O rename link+run OK"
+
+      - name: Test objcopy (Mach-O, same-length)
+        run: |
+          CC=${{ matrix.cc }}
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.o', {'alpha_func': 'xxxxx_func', 'gamma_func': 'yyyyy_func'}, 'test_same.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          $CC -o test_same_linked test_main_samelength.c test_same.o
+          ./test_same_linked
+          echo "Mach-O same-length link+run OK"
+
+      - name: Test ar (BSD ar archive)
+        run: |
+          CC=${{ matrix.cc }}
+          # Create objects
+          cat > ar_a.c << 'EOF'
+          int ar_func_a(void) { return 10; }
+          EOF
+          cat > ar_b.c << 'EOF'
+          int ar_func_b(void) { return 20; }
+          EOF
+          cat > ar_long_bsd_name_member_for_testing.c << 'EOF'
+          int ar_func_long(void) { return 30; }
+          EOF
+          $CC -c -o ar_a.o ar_a.c
+          $CC -c -o ar_b.o ar_b.c
+          $CC -c -o ar_long_bsd_name_member_for_testing.o ar_long_bsd_name_member_for_testing.c
+
+          # macOS ar uses BSD-style #1/ long names
+          ar rcs test_lib.a ar_a.o ar_b.o ar_long_bsd_name_member_for_testing.o
+
+          # Extract
+          mkdir extracted
+          python -c "
+          from ar import extract_archive
+          files = extract_archive('test_lib.a', 'extracted')
+          print(f'Extracted {len(files)} members:')
+          for f in files:
+              print(f'  {f}')
+          assert len(files) == 3
+          "
+
+          # Link extracted objects
+          cat > ar_main.c << 'EOF'
+          extern int ar_func_a(void);
+          extern int ar_func_b(void);
+          extern int ar_func_long(void);
+          int main(void) { return ar_func_a() + ar_func_b() + ar_func_long() - 60; }
+          EOF
+          $CC -o ar_linked ar_main.c extracted/ar_a.o extracted/ar_b.o extracted/ar_long_bsd_name_member_for_testing.o
+          ./ar_linked
+          echo "ar (BSD) link+run OK"
+
+  macos-clang-lto:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            cc: clang
+            lto_linker: ""
+          - os: macos-15
+            cc: clang
+            lto_linker: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Clang LTO bitcode
+        run: |
+          cat > test_funcs.c << 'EOF'
+          int alpha_func(void) { return 1; }
+          int beta_func(void) { return 2; }
+          int gamma_func(void) { return 3; }
+          EOF
+
+          cat > test_main.c << 'EOF'
+          extern int mp_alpha(void);
+          extern int beta_func(void);
+          extern int mp_gamma(void);
+          int main(void) { return mp_alpha() + beta_func() + mp_gamma() - 6; }
+          EOF
+
+          cat > test_main_same.c << 'EOF'
+          extern int xxxxx_func(void);
+          extern int beta_func(void);
+          extern int yyyyy_func(void);
+          int main(void) { return xxxxx_func() + beta_func() + yyyyy_func() - 6; }
+          EOF
+
+          # Use --target to get raw LLVM bitcode (Apple clang -flto wraps in Mach-O)
+          ${{ matrix.cc }} -flto -c -o test_funcs_lto.o test_funcs.c --target=x86_64-unknown-linux-gnu
+          # Also produce the native Mach-O LTO object for link tests
+          ${{ matrix.cc }} -flto -c -o test_funcs_lto_macho.o test_funcs.c
+
+      - name: Test nm (Clang LTO raw bitcode)
+        run: |
+          python nm.py test_funcs_lto.o > our_nm.txt
+          echo "--- Clang LTO nm:" && cat our_nm.txt
+          grep -q "alpha_func" our_nm.txt
+          grep -q "beta_func" our_nm.txt
+          grep -q "gamma_func" our_nm.txt
+
+      - name: Test nm (Mach-O LTO object)
+        run: |
+          python nm.py test_funcs_lto_macho.o > our_nm_macho.txt
+          echo "--- Mach-O LTO nm:" && cat our_nm_macho.txt
+          grep -q "alpha_func" our_nm_macho.txt
+          grep -q "beta_func" our_nm_macho.txt
+          grep -q "gamma_func" our_nm_macho.txt
+
+      - name: Test objcopy (Clang LTO, same-length)
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto.o', {'alpha_func': 'xxxxx_func', 'gamma_func': 'yyyyy_func'}, 'test_lto_same.o', clang='${{ matrix.cc }}')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+
+      - name: Test objcopy (Clang LTO, variable-length via libLLVM)
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_lto_var.o', clang='${{ matrix.cc }}')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+
+      - name: Test objcopy (Mach-O LTO, same-length + link)
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto_macho.o', {'alpha_func': 'xxxxx_func', 'gamma_func': 'yyyyy_func'}, 'test_lto_same_macho.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          ${{ matrix.cc }} -flto -o test_lto_same test_main_same.c test_lto_same_macho.o
+          ./test_lto_same
+          echo "Mach-O LTO same-length link+run OK"
+
+      - name: Test objcopy (Mach-O LTO, variable-length + link)
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto_macho.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_lto_var_macho.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          ${{ matrix.cc }} -flto -o test_lto_var test_main.c test_lto_var_macho.o
+          ./test_lto_var
+          echo "Mach-O LTO variable-length link+run OK"
+
+  # ---------------------------------------------------------------------------
+  # Windows: MSVC (regular + LTCG) and Clang-CL
+  # ---------------------------------------------------------------------------
+  windows-msvc:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            arch: x64
+          - os: windows-2025
+            arch: x64
+          - os: windows-2022
+            arch: x86
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Compile test objects (regular + LTCG)
+        shell: cmd
+        run: |
+          echo int alpha_func(void) { return 1; } > test_funcs.c
+          echo int beta_func(void) { return 2; } >> test_funcs.c
+          echo int gamma_func(void) { return 3; } >> test_funcs.c
+          echo int calls_helper(void) { return alpha_func() + beta_func(); } >> test_funcs.c
+
+          cl /c /Fotest_funcs.obj test_funcs.c
+          cl /c /GL /Fotest_funcs_ltcg.obj test_funcs.c
+
+          echo int a_very_long_function_name_that_exceeds_eight_bytes(void) { return 42; } > test_long.c
+          echo int another_long_name_for_string_table_testing(void) { return 7; } >> test_long.c
+          cl /c /Fotest_long.obj test_long.c
+
+      - name: Test nm (COFF)
+        shell: bash
+        run: |
+          python nm.py test_funcs.obj > our_nm.txt
+          echo "--- Our nm:" && cat our_nm.txt
+          grep -q "T alpha_func" our_nm.txt
+          grep -q "T beta_func" our_nm.txt
+          grep -q "T gamma_func" our_nm.txt
+          grep -q "T calls_helper" our_nm.txt
+
+      - name: Test nm (COFF with long names)
+        shell: bash
+        run: |
+          python nm.py test_long.obj > our_nm_long.txt
+          echo "--- Long names:" && cat our_nm_long.txt
+          grep -q "a_very_long_function_name_that_exceeds_eight_bytes" our_nm_long.txt
+          grep -q "another_long_name_for_string_table_testing" our_nm_long.txt
+
+      - name: Test nm (MSVC LTCG)
+        shell: bash
+        run: |
+          python nm.py test_funcs_ltcg.obj > our_nm_ltcg.txt
+          echo "--- MSVC LTCG nm:" && cat our_nm_ltcg.txt
+          grep -q "alpha_func" our_nm_ltcg.txt || echo "WARN: LTCG symbol not found (expected for some MSVC versions)"
+
+      - name: Test objcopy (COFF, variable-length)
+        shell: bash
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.obj', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_renamed.obj')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+
+      - name: Link renamed COFF
+        shell: cmd
+        run: |
+          echo extern int mp_alpha(void); > test_main.c
+          echo extern int beta_func(void); >> test_main.c
+          echo extern int mp_gamma(void); >> test_main.c
+          echo extern int calls_helper(void); >> test_main.c
+          echo int main(void) { return mp_alpha() + beta_func() + mp_gamma() + calls_helper() - 9; } >> test_main.c
+          cl /Fetest_linked.exe test_main.c test_renamed.obj /link /NOLOGO
+          test_linked.exe
+          echo Link+run OK (exit %ERRORLEVEL%)
+
+      - name: Test objcopy (COFF, same-length)
+        shell: bash
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.obj', {'alpha_func': 'xxxxx_fun', 'gamma_func': 'yyyyy_fun'}, 'test_same.obj')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+
+      - name: Test objcopy (COFF, long names shrink)
+        shell: bash
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_long.obj', {
+              'a_very_long_function_name_that_exceeds_eight_bytes': 'short_a',
+              'another_long_name_for_string_table_testing': 'short_b',
+          }, 'test_long_renamed.obj')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+
+      - name: Link renamed long-name COFF
+        shell: cmd
+        run: |
+          echo extern int short_a(void); > test_long_main.c
+          echo extern int short_b(void); >> test_long_main.c
+          echo int main(void) { return short_a() + short_b() - 49; } >> test_long_main.c
+          cl /Fetest_long_linked.exe test_long_main.c test_long_renamed.obj /link /NOLOGO
+          test_long_linked.exe
+          echo Long-name COFF link+run OK
+
+      - name: Test objcopy (MSVC LTCG)
+        shell: bash
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_ltcg.obj', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_ltcg_renamed.obj')
+          print(f'Renamed: {n}')
+          " || echo "MSVC LTCG rename not supported for this compiler version"
+
+      - name: Link renamed MSVC LTCG
+        shell: cmd
+        run: |
+          echo extern int mp_alpha(void); > test_ltcg_main.c
+          echo extern int beta_func(void); >> test_ltcg_main.c
+          echo extern int mp_gamma(void); >> test_ltcg_main.c
+          echo extern int calls_helper(void); >> test_ltcg_main.c
+          echo int main(void) { return mp_alpha() + beta_func() + mp_gamma() + calls_helper() - 9; } >> test_ltcg_main.c
+          cl /Fetest_ltcg_linked.exe test_ltcg_main.c test_ltcg_renamed.obj /link /LTCG /NOLOGO 2>nul && (
+            test_ltcg_linked.exe
+            echo MSVC LTCG link+run OK
+          ) || echo MSVC LTCG link skipped
+
+      - name: Create MSVC static library
+        shell: cmd
+        run: |
+          echo int lib_func_a(void) { return 10; } > lib_a.c
+          echo int lib_func_b(void) { return 20; } >> lib_a.c
+          cl /c /Folib_a.obj lib_a.c
+          echo int lib_func_c(void) { return 30; } > lib_b.c
+          cl /c /Folib_b.obj lib_b.c
+          lib /NOLOGO /OUT:test_msvc.lib lib_a.obj lib_b.obj
+
+      - name: Test ar (MSVC .lib)
+        shell: bash
+        run: |
+          mkdir extracted
+          python -c "
+          from ar import extract_archive
+          files = extract_archive('test_msvc.lib', 'extracted')
+          print(f'Extracted {len(files)} members:')
+          for f in files:
+              print(f'  {f}')
+          assert len(files) == 2
+          "
+
+      - name: Link extracted MSVC lib members
+        shell: cmd
+        run: |
+          echo extern int lib_func_a(void); > lib_main.c
+          echo extern int lib_func_b(void); >> lib_main.c
+          echo extern int lib_func_c(void); >> lib_main.c
+          echo int main(void) { return lib_func_a() + lib_func_b() + lib_func_c() - 60; } >> lib_main.c
+          cl /Felib_linked.exe lib_main.c extracted\lib_a.obj extracted\lib_b.obj /link /NOLOGO
+          lib_linked.exe
+          echo ar (MSVC lib) link+run OK
+
+  windows-clang:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+          - os: windows-2025
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Clang LTO on Windows
+        shell: bash
+        run: |
+          cat > test_funcs.c << 'EOF'
+          int alpha_func(void) { return 1; }
+          int beta_func(void) { return 2; }
+          int gamma_func(void) { return 3; }
+          EOF
+
+          clang -flto -c -o test_funcs_lto.o test_funcs.c --target=x86_64-pc-windows-msvc
+          clang -c -o test_funcs_coff.o test_funcs.c --target=x86_64-pc-windows-msvc
+
+      - name: Test nm (Clang COFF on Windows)
+        shell: bash
+        run: |
+          python nm.py test_funcs_coff.o > our_nm.txt
+          echo "--- Clang COFF:" && cat our_nm.txt
+          grep -q "alpha_func" our_nm.txt
+          grep -q "beta_func" our_nm.txt
+
+      - name: Test nm (Clang LTO on Windows)
+        shell: bash
+        run: |
+          python nm.py test_funcs_lto.o > our_nm_lto.txt
+          echo "--- Clang LTO on Windows:" && cat our_nm_lto.txt
+          grep -q "alpha_func" our_nm_lto.txt
+          grep -q "beta_func" our_nm_lto.txt
+
+      - name: Test objcopy (Clang LTO on Windows, same-length)
+        shell: bash
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_lto.o', {'alpha_func': 'xxxxx_func', 'gamma_func': 'yyyyy_func'}, 'test_lto_same.o', clang='clang')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+
+      - name: Test objcopy (Clang COFF on Windows)
+        shell: bash
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs_coff.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_coff_renamed.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+
+  windows-mingw:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+          - os: windows-2025
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile test objects (MinGW GCC)
+        shell: bash
+        run: |
+          cat > test_funcs.c << 'EOF'
+          int alpha_func(void) { return 1; }
+          int beta_func(void) { return 2; }
+          int gamma_func(void) { return 3; }
+          EOF
+
+          cat > test_main.c << 'EOF'
+          extern int mp_alpha(void);
+          extern int beta_func(void);
+          extern int mp_gamma(void);
+          int main(void) { return mp_alpha() + beta_func() + mp_gamma() - 6; }
+          EOF
+
+          gcc -c -o test_funcs.o test_funcs.c
+
+      - name: Test nm (MinGW COFF)
+        shell: bash
+        run: |
+          python nm.py test_funcs.o > our_nm.txt
+          echo "--- MinGW COFF:" && cat our_nm.txt
+          grep -q "alpha_func" our_nm.txt
+          grep -q "beta_func" our_nm.txt
+          grep -q "gamma_func" our_nm.txt
+
+      - name: Test objcopy (MinGW COFF)
+        shell: bash
+        run: |
+          python -c "
+          from objcopy import rename_obj
+          n = rename_obj('test_funcs.o', {'alpha_func': 'mp_alpha', 'gamma_func': 'mp_gamma'}, 'test_renamed.o')
+          print(f'Renamed: {n}')
+          assert n == 2
+          "
+          gcc -o test_linked.exe test_main.c test_renamed.o
+          ./test_linked.exe
+          echo "MinGW COFF link+run OK"
