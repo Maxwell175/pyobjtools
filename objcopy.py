@@ -75,10 +75,13 @@ def detect_obj_format(path):
     Returns: 'elf', 'macho', 'coff', 'msvc-lto', 'clang-lto', 'gcc-lto', or None.
     """
     with open(path, 'rb') as f:
-        header = f.read(8)
+        header = f.read(20)
 
     if len(header) < 4:
         return None
+
+    if header[:4] == b'\xde\xc0\x17\x0b':
+        return 'clang-lto'
 
     if header[:2] == b'BC' and header[2:4] == b'\xc0\xde':
         return 'clang-lto'
@@ -1018,18 +1021,43 @@ def _find_libllvm(clang_binary="clang"):
                     return ctypes.CDLL(match)
                 except OSError:
                     continue
-    else:
+    elif sys.platform == "darwin":
+        try:
+            r = subprocess.run(["xcode-select", "-p"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                xcode_lib = os.path.join(r.stdout.strip(), "Toolchains/XcodeDefault.xctoolchain/usr/lib")
+                for match in glob_mod.glob(os.path.join(xcode_lib, "libLLVM*.dylib")):
+                    try:
+                        return ctypes.CDLL(match)
+                    except OSError:
+                        continue
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         for ver in range(25, 14, -1):
-            for name in (f"libLLVM-{ver}.so", f"libLLVM-{ver}.dylib"):
-                try:
-                    return ctypes.CDLL(name)
-                except OSError:
-                    continue
-        for name in ("libLLVM.so", "libLLVM.dylib"):
             try:
-                return ctypes.CDLL(name)
+                return ctypes.CDLL(f"libLLVM-{ver}.dylib")
             except OSError:
                 continue
+        try:
+            return ctypes.CDLL("libLLVM.dylib")
+        except OSError:
+            pass
+        lib_name = ctypes.util.find_library("LLVM")
+        if lib_name:
+            try:
+                return ctypes.CDLL(lib_name)
+            except OSError:
+                pass
+    else:
+        for ver in range(25, 14, -1):
+            try:
+                return ctypes.CDLL(f"libLLVM-{ver}.so")
+            except OSError:
+                continue
+        try:
+            return ctypes.CDLL("libLLVM.so")
+        except OSError:
+            pass
         lib_name = ctypes.util.find_library("LLVM")
         if lib_name:
             try:
@@ -1125,6 +1153,24 @@ def _clang_lto_rename_variable_length(data, rename_map, clang="clang"):
     return new_data, renamed
 
 
+def _unwrap_bitcode(data):
+    """Unwrap LLVM bitcode wrapper format (magic 0x0B17C0DE).
+    Returns (inner_data, wrapper_header) or (data, None) if not wrapped."""
+    if len(data) >= 20 and data[:4] == b'\xde\xc0\x17\x0b':
+        offset = struct.unpack_from('<I', data, 8)[0]
+        size = struct.unpack_from('<I', data, 12)[0]
+        return bytearray(data[offset:offset + size]), bytearray(data[:offset])
+    return data, None
+
+
+def _rewrap_bitcode(inner_data, wrapper_header):
+    """Rewrap bitcode with its wrapper header, updating the size field."""
+    if wrapper_header is None:
+        return inner_data
+    struct.pack_into('<I', wrapper_header, 12, len(inner_data))
+    return bytearray(wrapper_header) + inner_data
+
+
 def rename_clang_lto(obj_path, rename_map, output_path=None, clang="clang"):
     """Rename symbols in a Clang LTO bitcode object file.
 
@@ -1135,12 +1181,14 @@ def rename_clang_lto(obj_path, rename_map, output_path=None, clang="clang"):
         output_path = obj_path
 
     with open(obj_path, "rb") as f:
-        data = bytearray(f.read())
+        raw_data = bytearray(f.read())
+
+    data, wrapper = _unwrap_bitcode(raw_data)
 
     if not _all_same_length(rename_map):
         new_data, renamed = _clang_lto_rename_variable_length(data, rename_map, clang)
         with open(output_path, "wb") as f:
-            f.write(new_data)
+            f.write(_rewrap_bitcode(new_data, wrapper))
         return renamed
 
     blocks = _clang_lto_parse_layout(data)
@@ -1157,7 +1205,7 @@ def rename_clang_lto(obj_path, rename_map, output_path=None, clang="clang"):
         data, strtab_block[0], strtab_block[1], rename_map)
 
     with open(output_path, "wb") as f:
-        f.write(new_data)
+        f.write(_rewrap_bitcode(new_data, wrapper))
     return renamed
 
 

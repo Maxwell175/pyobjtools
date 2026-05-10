@@ -42,10 +42,13 @@ class Symbol:
 
 def detect_format(path):
     with open(path, 'rb') as f:
-        header = f.read(8)
+        header = f.read(20)
 
     if len(header) < 4:
         return None
+
+    if header[:4] == b'\xde\xc0\x17\x0b':
+        return 'clang-lto'
 
     if header[:2] == b'BC' and header[2:4] == b'\xc0\xde':
         return 'clang-lto'
@@ -471,9 +474,17 @@ def nm_coff(path):
 # Clang LTO (LLVM bitcode)
 # =============================================================================
 
+def _unwrap_bitcode(data):
+    if data[:4] == b'\xde\xc0\x17\x0b':
+        offset = struct.unpack_from('<I', data, 8)[0]
+        size = struct.unpack_from('<I', data, 12)[0]
+        return data[offset:offset + size]
+    return data
+
+
 def nm_clang_lto(path):
     with open(path, 'rb') as f:
-        data = f.read()
+        data = _unwrap_bitcode(f.read())
 
     blocks = []
     pos_bits = 32
@@ -536,43 +547,47 @@ def nm_clang_lto(path):
     if strtab_block is None:
         return []
 
-    # Skip 8 bytes of bitstream overhead (DEFINE_ABBREV + record header)
-    strtab_data = bytes(strtab_block[8:])
-    # Strip trailing padding zeros
-    strtab_data = strtab_data.rstrip(b'\x00')
-
     symbols = []
 
-    if symtab_block and len(symtab_block) > 32:
-        # SYMTAB blob starts 8 bytes into block content (same overhead)
-        # Last 4 bytes are END_BLOCK marker
-        symtab_blob = bytes(symtab_block[8:-4])
+    if symtab_block and len(symtab_block) > 24:
+        raw_strtab = bytes(strtab_block)
+        raw_symtab = bytes(symtab_block)
 
-        # Symbol entries are 24 bytes: (name_off, name_sz, irname_off, irname_sz, comdat, flags)
-        # Search for the start of the symbol array by finding valid runs
-        blob_size = len(symtab_blob)
-        best_offset = None
+        best_result = None
         best_count = 0
 
-        for start in range(0, min(blob_size - 24, 128), 4):
-            count = 0
-            pos = start
-            while pos + 24 <= blob_size:
-                name_off = struct.unpack_from("<I", symtab_blob, pos)[0]
-                name_sz = struct.unpack_from("<I", symtab_blob, pos + 4)[0]
-                if (name_sz > 0 and name_sz < 4096
-                        and name_off + name_sz <= len(strtab_data)):
-                    count += 1
-                    pos += 24
-                else:
-                    break
-            if count > best_count:
-                best_count = count
-                best_offset = start
+        for str_skip in range(0, min(len(raw_strtab), 64)):
+            strtab_data = raw_strtab[str_skip:]
+            strtab_len = len(strtab_data)
+            if strtab_len < 1:
+                continue
 
-        if best_offset is not None and best_count > 0:
-            for i in range(best_count):
-                pos = best_offset + i * 24
+            for sym_skip in range(0, min(len(raw_symtab) - 24, 128), 4):
+                symtab_blob = raw_symtab[sym_skip:]
+                blob_size = len(symtab_blob)
+                count = 0
+                pos = 0
+                while pos + 24 <= blob_size:
+                    name_off = struct.unpack_from("<I", symtab_blob, pos)[0]
+                    name_sz = struct.unpack_from("<I", symtab_blob, pos + 4)[0]
+                    if (0 < name_sz < 4096
+                            and name_off + name_sz <= strtab_len
+                            and all(b == 95 or 48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122
+                                    for b in strtab_data[name_off:name_off + name_sz])):
+                        count += 1
+                        pos += 24
+                    else:
+                        break
+                if count > best_count:
+                    best_count = count
+                    best_result = (str_skip, sym_skip, count)
+
+        if best_result and best_count >= 3:
+            str_skip, sym_skip, count = best_result
+            strtab_data = raw_strtab[str_skip:]
+            symtab_blob = raw_symtab[sym_skip:]
+            for i in range(count):
+                pos = i * 24
                 name_off = struct.unpack_from("<I", symtab_blob, pos)[0]
                 name_sz = struct.unpack_from("<I", symtab_blob, pos + 4)[0]
                 flags = struct.unpack_from("<I", symtab_blob, pos + 20)[0]
@@ -623,21 +638,26 @@ def nm_gcc_lto(path):
         end = shstrtab.index(b"\x00", off)
         return shstrtab[off:end].decode("ascii")
 
-    symtab_idx = None
-    for i in range(e_shnum):
-        if sections[i]["sh_type"] == 2:
-            symtab_idx = i
-            break
-
-    if symtab_idx is not None:
-        return nm_elf(path)
+    def _try_decompress(raw):
+        if raw[:4] == b'\x28\xb5\x2f\xfd':
+            try:
+                try:
+                    from compression import zstd
+                    return zstd.decompress(raw)
+                except ImportError:
+                    pass
+                import zstandard
+                return zstandard.ZstdDecompressor().decompress(raw)
+            except Exception:
+                return raw
+        return raw
 
     symbols = []
     for i in range(e_shnum):
         name = sec_name(i)
         if ".symtab" in name and "lto" in name and "ext" not in name:
             sec = sections[i]
-            sec_data = data[sec["sh_offset"]:sec["sh_offset"] + sec["sh_size"]]
+            sec_data = _try_decompress(data[sec["sh_offset"]:sec["sh_offset"] + sec["sh_size"]])
             pos = 0
             while pos < len(sec_data):
                 end = sec_data.find(b'\x00', pos)
